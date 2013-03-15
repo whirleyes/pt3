@@ -26,7 +26,7 @@
 #include <linux/interrupt.h>
 #include <linux/version.h>
 #include <linux/mutex.h>
-
+#include <linux/pm_runtime.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,4,0)
 #include <asm/system.h>
 #endif
@@ -145,6 +145,7 @@ typedef	struct	_pt3_device{
 	__u8 __iomem* hw_addr[2];
 	struct mutex		lock ;
 	dev_t			dev ;
+	struct device		*device;
 	int			card_number;
 	__u32			base_minor ;
 	struct	cdev	cdev[MAX_CHANNEL];
@@ -662,6 +663,10 @@ pt3_open(struct inode *inode, struct file *file)
 						PT3_PRINTK(1, KERN_DEBUG, "device is already used.\n");
 						return -EIO;
 					}
+#ifdef CONFIG_PM_RUNTIME
+					PT3_PRINTK(1, KERN_INFO, "Request pm_runtime_get_sync\n");
+					pm_runtime_get_sync(device[lp]->device);
+#endif /* CONFIG_PM_RUNTIME */
 					PT3_PRINTK(7, KERN_DEBUG, "selected tuner_no=%d type=%d\n",
 							channel->tuner->tuner_no, channel->type);
 
@@ -699,7 +704,10 @@ pt3_release(struct inode *inode, struct file *file)
 				pt3_dma_get_ts_error_packet_count(channel->dma));
 	set_tuner_sleep(channel->type, channel->tuner, 1);
 	schedule_timeout_interruptible(msecs_to_jiffies(50));
-
+#ifdef CONFIG_PM_RUNTIME
+	PT3_PRINTK(1, KERN_INFO, "pm_runtime_put_sync\n");
+	pm_runtime_put_sync(channel->ptr->device);
+#endif /* CONFIG_PM_RUNTIME */
 	return 0;
 }
 
@@ -884,6 +892,21 @@ static const struct file_operations pt3_fops = {
 	.llseek		=	no_llseek,
 };
 
+#ifdef CONFIG_PM
+static void
+pt3_pci_runtime_pm_allow(struct device *dev)
+{
+#ifdef CONFIG_PM_RUNTIME
+	pm_runtime_put_noidle(dev);
+	pm_runtime_allow(dev);
+	pm_runtime_set_autosuspend_delay(dev, 60);
+	pm_runtime_use_autosuspend(dev);
+#endif /* CONFIG_PM_RUNTIME */
+	pm_suspend_ignore_children(dev, 1);
+	to_pci_dev(dev)->pme_poll = false;
+}
+#endif /* CONFIG_PM */
+
 static int __devinit
 pt3_pci_init_one (struct pci_dev *pdev, const struct pci_device_id *ent)
 {
@@ -927,6 +950,7 @@ pt3_pci_init_one (struct pci_dev *pdev, const struct pci_device_id *ent)
 	PT3_PRINTK(7, KERN_DEBUG, "Allocate PT3_DEVICE.\n");
 
 	// PCIアドレスをマップする
+	dev_conf->device = &pdev->dev;
 	dev_conf->bars = bars;
 	dev_conf->hw_addr[0] = pci_ioremap_bar(pdev, 0);
 	if (!dev_conf->hw_addr[0])
@@ -1047,6 +1071,9 @@ pt3_pci_init_one (struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	pci_set_drvdata(pdev, dev_conf);
+#ifdef CONFIG_PM
+	pt3_pci_runtime_pm_allow(&pdev->dev);
+#endif /* CONFIG_PM */
 	return 0;
 
 out_err_dma:
@@ -1140,21 +1167,78 @@ pt3_pci_remove_one(struct pci_dev *pdev)
 }
 
 #ifdef CONFIG_PM
-
 static int
-pt3_pci_suspend (struct pci_dev *pdev, pm_message_t state)
+pt3_pci_suspend_common(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
+	pci_save_state(pdev);
+	pci_disable_device(pdev);
+	pci_enable_wake(pdev, PCI_D3cold, device_may_wakeup(dev));
+	pci_set_power_state(pdev, PCI_D3cold);
+	PT3_PRINTK(1, KERN_INFO, "suspend (%d)\n", pdev->current_state);
 	return 0;
 }
 
 static int
-pt3_pci_resume (struct pci_dev *pdev)
+pt3_pci_resume_common(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
+	pci_back_from_sleep(pdev);
+	pci_restore_state(pdev);
+	if (pci_enable_device(pdev))
+		return 1;
+	pci_set_master(pdev);
+	PT3_PRINTK(1, KERN_INFO, "resume @ (%d)\n", pdev->current_state);
 	return 0;
 }
 
+static int
+pt3_pci_suspend(struct device *dev)
+{
+	PT3_PRINTK(1, KERN_INFO, "not requested by runtime\n");
+	pt3_pci_suspend_common(dev);
+	return 0;
+}
+
+static int
+pt3_pci_resume(struct device *dev)
+{
+	PT3_PRINTK(1, KERN_INFO, "not requested by runtime\n");
+	pt3_pci_resume_common(dev);
+	return 0;
+}
+
+#ifdef  CONFIG_PM_RUNTIME
+static int
+pt3_pci_runtime_suspend(struct device *dev)
+{
+    pt3_pci_suspend_common(dev);
+    return 0;
+}
+
+static int
+pt3_pci_runtime_resume(struct device *dev)
+{
+    pt3_pci_resume_common(dev);
+    return 0;
+}
+#endif  /* CONFIG_PM_RUNTIME */
 #endif /* CONFIG_PM */
 
+static const struct dev_pm_ops pt3_pci_pm_ops = {
+#ifdef CONFIG_PM
+	.suspend	= pt3_pci_suspend,
+	.resume		= pt3_pci_resume,
+	.freeze		= pt3_pci_suspend,
+	.thaw		= pt3_pci_resume,
+	.poweroff	= pt3_pci_suspend,
+	.restore	= pt3_pci_resume,
+#ifdef CONFIG_PM_RUNTIME
+	.runtime_suspend = pt3_pci_runtime_suspend,
+	.runtime_resume = pt3_pci_runtime_resume,
+#endif /* CONFIG_PM_RUNTIME */
+#endif /* CONFIG_PM */
+};
 
 static struct pci_driver pt3_driver = {
 	.name		= pt3_driver_name,
@@ -1162,10 +1246,10 @@ static struct pci_driver pt3_driver = {
 	.remove		= __devexit_p(pt3_pci_remove_one),
 	.id_table	= pt3_pci_tbl,
 #ifdef CONFIG_PM
-	.suspend	= pt3_pci_suspend,
-	.resume		= pt3_pci_resume,
+	.driver		= {
+		.pm		= &pt3_pci_pm_ops
+	},
 #endif /* CONFIG_PM */
-
 };
 
 
